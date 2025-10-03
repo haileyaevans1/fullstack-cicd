@@ -1,48 +1,57 @@
 name: Backend CI/CD
+
 on:
+  workflow_dispatch:
   push:
-    branches: ["main"]
-  workflow_dispatch: {}
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend.yml"
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  S3_BUCKET:  ${{ secrets.S3_BUCKET_NAME }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Build backend image
         run: |
-          docker build -t app-backend:latest backend
-          docker save app-backend:latest | gzip > backend.tar.gz
+          docker build -t api:latest ./backend
+          docker save api:latest | gzip > backend.tar.gz
+          ls -lh backend.tar.gz
 
-      - name: Copy image to EC2
-        uses: appleboy/scp-action@v0.1.7
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_KEY }}
-          source: "backend.tar.gz"
-          target: "~/"
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Run backend container on EC2
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            set -e
-            sudo yum install -y docker || true
-            sudo systemctl enable docker || true
-            sudo systemctl start docker || true
-            docker load -i backend.tar.gz
-            docker rm -f app-backend || true
-            docker run -d --name app-backend --restart unless-stopped \
-              -p 8080:8080 \
-              -e DB_HOST='${{ secrets.DB_HOST }}' \
-              -e DB_USER='${{ secrets.DB_USER }}' \
-              -e DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
-              -e DB_NAME='${{ secrets.DB_NAME }}' \
-              app-backend:latest
-            sleep 5
-            curl -fsS http://localhost:8080/health
+      - name: Upload artifact to S3
+        run: |
+          aws s3 cp backend.tar.gz s3://$S3_BUCKET/artifacts/backend.tar.gz --acl private
+
+      - name: Deploy via SSM (no SSH)
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy backend container" \
+            --parameters commands='[
+              "set -e",
+              "which dnf >/dev/null 2>&1 && sudo dnf -y install awscli || sudo yum -y install awscli || true",
+              "sudo systemctl start docker || true",
+              "aws s3 cp s3://'"$S3_BUCKET"'/artifacts/backend.tar.gz /tmp/backend.tar.gz",
+              "sudo docker load -i /tmp/backend.tar.gz",
+              "sudo docker rm -f api || true",
+              "sudo docker run -d --name api -p 8080:8080 -e DB_HOST=${{ secrets.DB_HOST }} -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=${{ secrets.DB_NAME }} api:latest"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+          echo "SSM CommandId: $CMD_ID"
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+          echo "SSM deploy finished."
