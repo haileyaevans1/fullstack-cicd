@@ -1,0 +1,48 @@
+name: Backend CI/CD
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: |
+          docker build -t app-backend:latest backend
+          docker save app-backend:latest | gzip > backend.tar.gz
+
+      - name: Copy image to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          source: "backend.tar.gz"
+          target: "~/"
+
+      - name: Run backend container on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          script: |
+            set -e
+            sudo yum install -y docker || true
+            sudo systemctl enable docker || true
+            sudo systemctl start docker || true
+            docker load -i backend.tar.gz
+            docker rm -f app-backend || true
+            docker run -d --name app-backend --restart unless-stopped \
+              -p 8080:8080 \
+              -e DB_HOST='${{ secrets.DB_HOST }}' \
+              -e DB_USER='${{ secrets.DB_USER }}' \
+              -e DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
+              -e DB_NAME='${{ secrets.DB_NAME }}' \
+              app-backend:latest
+            sleep 5
+            curl -fsS http://localhost:8080/health
